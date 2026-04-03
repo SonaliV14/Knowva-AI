@@ -25,6 +25,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -36,6 +37,13 @@ export default function ChatPage() {
 
   useEffect(() => { scrollToBottom(); }, [messages, isLoading, scrollToBottom]);
 
+  // Auto-dismiss error after 4 seconds
+  useEffect(() => {
+    if (!errorMsg) return;
+    const t = setTimeout(() => setErrorMsg(null), 4000);
+    return () => clearTimeout(t);
+  }, [errorMsg]);
+
   // Auto-resize textarea
   useEffect(() => {
     const ta = textareaRef.current;
@@ -44,36 +52,58 @@ export default function ChatPage() {
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }, [input]);
 
-  // ── File handling ──
-  const addDoc = async (file: File) => {
-    const id = Date.now() + Math.random();
-    const newDoc: Doc = {
-      id,
+  // ── File handling ──────────────────────────────────────────────────────────
+  const addDoc = async (files: File[]) => {
+    // Check max 5 files
+    if (files.length > 5) {
+      setErrorMsg('Maximum 5 files can be uploaded at a time.');
+      return;
+    }
+
+    const newDocs: Doc[] = files.map((file) => ({
+      id: Date.now() + Math.random(),
       name: file.name,
       size: formatSize(file.size),
-      status: 'processing',
-    };
-    setDocs((prev) => [...prev, newDoc]);
+      status: 'processing' as const,
+    }));
+
+    setDocs((prev) => [...prev, ...newDocs]);
 
     const form = new FormData();
-    form.append('pdf', file);
+    files.forEach((file) => form.append('pdf', file));
 
     try {
-      await fetch('http://localhost:8000/upload/pdf', { method: 'POST', body: form });
+      const res = await fetch('http://localhost:8000/upload/pdf', {
+        method: 'POST',
+        body: form,
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setErrorMsg(data.error || 'Upload failed.');
+        // Remove the docs we just added since upload failed
+        setDocs((prev) =>
+          prev.filter((d) => !newDocs.find((n) => n.id === d.id))
+        );
+        return;
+      }
     } catch {
       // Server may not be running in dev — still show indexed after delay
     }
 
     setTimeout(() => {
       setDocs((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, status: 'indexed' } : d))
+        prev.map((d) =>
+          newDocs.find((n) => n.id === d.id) ? { ...d, status: 'indexed' } : d
+        )
       );
     }, 2200);
   };
 
   const handleFiles = (files: FileList | null) => {
-    if (!files) return;
-    Array.from(files).forEach(addDoc);
+    if (!files || files.length === 0) return;
+    const arr = Array.from(files);
+    addDoc(arr);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -85,10 +115,16 @@ export default function ChatPage() {
   const removeDoc = (id: number) =>
     setDocs((prev) => prev.filter((d) => d.id !== id));
 
-  // ── Send message ──
+  // ── Send message ───────────────────────────────────────────────────────────
   const sendMessage = async () => {
     const text = input.trim();
     if (!text || isLoading) return;
+
+    // Check if any files have been uploaded
+    if (docs.length === 0) {
+      setErrorMsg('No files uploaded. Please upload a PDF first!');
+      return;
+    }
 
     setMessages((prev) => [
       ...prev,
@@ -180,7 +216,7 @@ export default function ChatPage() {
           >
             <div className={styles.dropIcon}>📎</div>
             <div className={styles.dropTitle}>Drop files or click to upload</div>
-            <div className={styles.dropHint}>Add documents to search across</div>
+            <div className={styles.dropHint}>Max 5 PDFs at a time</div>
             <div className={styles.pills}>
               {['PDF', 'TXT', 'DOCX', 'MD'].map((t) => (
                 <span key={t} className={styles.pill}>{t}</span>
@@ -405,12 +441,20 @@ export default function ChatPage() {
             Enter to send · Shift+Enter for new line
           </div>
         </div>
+
+        {/* Error Toast */}
+        {errorMsg && (
+          <div className={styles.errorToast}>
+            <span>⚠️ {errorMsg}</span>
+            <button onClick={() => setErrorMsg(null)}>✕</button>
+          </div>
+        )}
       </main>
     </div>
   );
 }
 
-// ── Helpers ──
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
