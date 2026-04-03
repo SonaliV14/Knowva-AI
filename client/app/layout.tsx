@@ -16,6 +16,9 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: 'Knowva.AI — Intelligence Across Documents',
   description: 'Upload documents, ask questions, get synthesized answers powered by AI.',
+  icons: {
+    icon: '/favicon.svg',
+  },
 };
 
 export default function RootLayout({

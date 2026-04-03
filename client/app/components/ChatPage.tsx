@@ -52,7 +52,6 @@ export default function ChatPage() {
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }, [input]);
 
-  // ── File handling ──────────────────────────────────────────────────────────
   const addDoc = async (files: File[]) => {
     // Check max 5 files
     if (files.length > 5) {
@@ -88,7 +87,6 @@ export default function ChatPage() {
         return;
       }
     } catch {
-      // Server may not be running in dev — still show indexed after delay
     }
 
     setTimeout(() => {

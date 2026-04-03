@@ -6,14 +6,11 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import { pipeline } from '@xenova/transformers';
 import { mkdir } from 'fs/promises';
 
-// Make sure uploads folder exists
 await mkdir('uploads', { recursive: true });
 
-// ── Qdrant ──────────────────────────────────────────────────────────────────
 const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
 const COLLECTION = 'knowva-docs';
 
-// ── Local embedder (downloads model on first run, ~25 MB) ───────────────────
 let embedder = null;
 async function getEmbedder() {
   if (!embedder) {
@@ -29,12 +26,10 @@ async function embed(text) {
   return Array.from(output.data);
 }
 
-// ── BullMQ queue ─────────────────────────────────────────────────────────────
 const queue = new Queue('file-upload-queue', {
   connection: { host: 'localhost', port: 6379 },
 });
 
-// ── Multer storage ───────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, 'uploads/'),
   filename: (_req, file, cb) => {
@@ -57,10 +52,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ status: 'Knowva server is running!' }));
 
-// ── Upload PDF (max 5 at a time) ─────────────────────────────────────────────
 app.post('/upload/pdf', (req, res, next) => {
   upload.array('pdf', 5)(req, res, (err) => {
     if (err && err.code === 'LIMIT_UNEXPECTED_FILE') {
@@ -74,19 +67,16 @@ app.post('/upload/pdf', (req, res, next) => {
     next();
   });
 }, async (req, res) => {
-  // No files attached at all
   if (!req.files || req.files.length === 0) {
     return res.status(400).json({ error: 'No files uploaded.' });
   }
 
-  // Extra safety check
   if (req.files.length > 5) {
     return res.status(400).json({
       error: 'Maximum 5 files can be uploaded at a time.',
     });
   }
 
-  // Queue a separate job for each file
   for (const file of req.files) {
     await queue.add(
       'file-ready',
@@ -104,7 +94,6 @@ app.post('/upload/pdf', (req, res, next) => {
   });
 });
 
-// ── Chat ─────────────────────────────────────────────────────────────────────
 app.get('/chat', async (req, res) => {
   const userQuery = req.query.message;
 
@@ -113,7 +102,6 @@ app.get('/chat', async (req, res) => {
   }
 
   try {
-    // 1. Embed the user's query locally
     const queryVector = await embed(userQuery);
 
     // 2. Check collection exists
@@ -126,7 +114,6 @@ app.get('/chat', async (req, res) => {
       });
     }
 
-    // 3. Check if collection has any vectors
     const collectionInfo = await qdrant.getCollection(COLLECTION);
     const pointCount = collectionInfo.points_count ?? 0;
     if (pointCount === 0) {
@@ -136,14 +123,12 @@ app.get('/chat', async (req, res) => {
       });
     }
 
-    // 4. Search Qdrant for the 4 nearest chunks
     const searchResults = await qdrant.search(COLLECTION, {
       vector: queryVector,
       limit: 4,
       with_payload: true,
     });
 
-    // 5. Build context from retrieved chunks
     const contextText = searchResults
       .map((r, i) => {
         const source = r.payload?.source || `Document ${i + 1}`;
@@ -166,7 +151,6 @@ Important rules:
 Context retrieved from the user's uploaded documents:
 ${contextText || 'No relevant content was found in the uploaded documents.'}`;
 
-    // 6. Call Ollama (runs locally, 100% free)
     const ollamaRes = await fetch('http://localhost:11434/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -191,8 +175,6 @@ ${contextText || 'No relevant content was found in the uploaded documents.'}`;
 
     const ollamaData = await ollamaRes.json();
     const raw = ollamaData.message?.content ?? '';
-
-    // Safety strip — remove any leftover bracket artifacts
     const clean = raw
       .replace(/\[Page \d+\]/gi, '')
       .replace(/\[p\.\s*\d+\]/gi, '')
@@ -220,5 +202,5 @@ ${contextText || 'No relevant content was found in the uploaded documents.'}`;
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`\n🚀  Knowva server running → http://localhost:${PORT}\n`);
+  console.log(`\n  Knowva server running → http://localhost:${PORT}\n`);
 });
