@@ -1,4 +1,4 @@
-# Knowva-AI 🧠
+# ![logo](client/app/favicon.svg) Knowva-AI
 
 > **Ask anything. Across every document.**
 
