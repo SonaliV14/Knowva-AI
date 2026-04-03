@@ -42,7 +42,16 @@ const storage = multer.diskStorage({
     cb(null, `${unique}-${file.originalname}`);
   },
 });
-const upload = multer({ storage });
+
+const upload = multer({
+  storage,
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype !== 'application/pdf') {
+      return cb(new Error('Only PDF files are allowed.'));
+    }
+    cb(null, true);
+  },
+});
 
 const app = express();
 app.use(cors());
@@ -51,24 +60,47 @@ app.use(express.json());
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ status: 'Knowva server is running!' }));
 
-// ── Upload PDF ───────────────────────────────────────────────────────────────
-app.post('/upload/pdf', upload.single('pdf'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file was uploaded.' });
+// ── Upload PDF (max 5 at a time) ─────────────────────────────────────────────
+app.post('/upload/pdf', (req, res, next) => {
+  upload.array('pdf', 5)(req, res, (err) => {
+    if (err && err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({
+        error: 'Maximum 5 files can be uploaded at a time.',
+      });
+    }
+    if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  // No files attached at all
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ error: 'No files uploaded.' });
   }
 
-  await queue.add(
-    'file-ready',
-    JSON.stringify({
-      filename: req.file.originalname,
-      destination: req.file.destination,
-      path: req.file.path,
-    })
-  );
+  // Extra safety check
+  if (req.files.length > 5) {
+    return res.status(400).json({
+      error: 'Maximum 5 files can be uploaded at a time.',
+    });
+  }
+
+  // Queue a separate job for each file
+  for (const file of req.files) {
+    await queue.add(
+      'file-ready',
+      JSON.stringify({
+        filename: file.originalname,
+        destination: file.destination,
+        path: file.path,
+      })
+    );
+  }
 
   return res.json({
-    message: 'File uploaded successfully. Indexing has started.',
-    filename: req.file.originalname,
+    message: `${req.files.length} file(s) uploaded successfully. Indexing has started.`,
+    filenames: req.files.map((f) => f.originalname),
   });
 });
 
@@ -84,24 +116,34 @@ app.get('/chat', async (req, res) => {
     // 1. Embed the user's query locally
     const queryVector = await embed(userQuery);
 
-    // 2. Check collection exists before searching
+    // 2. Check collection exists
     const collections = await qdrant.getCollections();
     const exists = collections.collections.some((c) => c.name === COLLECTION);
     if (!exists) {
       return res.status(200).json({
-        message: "I don't have any documents to search yet. Please upload a PDF first!",
+        message: 'No files uploaded. Please upload a PDF first to get started!',
         docs: [],
       });
     }
 
-    // 3. Search Qdrant for the 4 nearest chunks
+    // 3. Check if collection has any vectors
+    const collectionInfo = await qdrant.getCollection(COLLECTION);
+    const pointCount = collectionInfo.points_count ?? 0;
+    if (pointCount === 0) {
+      return res.status(200).json({
+        message: 'No files uploaded. Please upload a PDF first to get started!',
+        docs: [],
+      });
+    }
+
+    // 4. Search Qdrant for the 4 nearest chunks
     const searchResults = await qdrant.search(COLLECTION, {
       vector: queryVector,
       limit: 4,
       with_payload: true,
     });
 
-    // 4. Build context from retrieved chunks
+    // 5. Build context from retrieved chunks
     const contextText = searchResults
       .map((r, i) => {
         const source = r.payload?.source || `Document ${i + 1}`;
@@ -124,14 +166,12 @@ Important rules:
 Context retrieved from the user's uploaded documents:
 ${contextText || 'No relevant content was found in the uploaded documents.'}`;
 
-    // 5. Call Ollama (runs locally, 100% free)
-    //    Make sure Ollama is running: ollama serve
-    //    Make sure you have pulled a model: ollama pull llama3
+    // 6. Call Ollama (runs locally, 100% free)
     const ollamaRes = await fetch('http://localhost:11434/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'phi3',         // change to 'mistral' or 'phi3' if preferred
+        model: 'llama3',
         stream: false,
         options: { temperature: 0.4, num_predict: 800 },
         messages: [
