@@ -11,6 +11,16 @@ await mkdir('uploads', { recursive: true });
 const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
 const COLLECTION = 'knowva-docs';
 
+const ALLOWED_EXTS = new Set(['.pdf', '.txt', '.docx', '.md']);
+const ALLOWED_MIMES = new Set([
+  'application/pdf',
+  'text/plain',
+  'text/markdown',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+  'application/octet-stream', // fallback some OSes use for .docx/.md
+]);
+
 let embedder = null;
 async function getEmbedder() {
   if (!embedder) {
@@ -41,8 +51,9 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype !== 'application/pdf') {
-      return cb(new Error('Only PDF files are allowed.'));
+    const ext = file.originalname.toLowerCase().slice(file.originalname.lastIndexOf('.'));
+    if (!ALLOWED_EXTS.has(ext) && !ALLOWED_MIMES.has(file.mimetype)) {
+      return cb(new Error('Only PDF, TXT, DOCX, and MD files are allowed.'));
     }
     cb(null, true);
   },
@@ -57,9 +68,7 @@ app.get('/', (_req, res) => res.json({ status: 'Knowva server is running!' }));
 app.post('/upload/pdf', (req, res, next) => {
   upload.array('pdf', 5)(req, res, (err) => {
     if (err && err.code === 'LIMIT_UNEXPECTED_FILE') {
-      return res.status(400).json({
-        error: 'Maximum 5 files can be uploaded at a time.',
-      });
+      return res.status(400).json({ error: 'Maximum 5 files can be uploaded at a time.' });
     }
     if (err) {
       return res.status(400).json({ error: err.message });
@@ -72,9 +81,7 @@ app.post('/upload/pdf', (req, res, next) => {
   }
 
   if (req.files.length > 5) {
-    return res.status(400).json({
-      error: 'Maximum 5 files can be uploaded at a time.',
-    });
+    return res.status(400).json({ error: 'Maximum 5 files can be uploaded at a time.' });
   }
 
   for (const file of req.files) {
@@ -96,6 +103,8 @@ app.post('/upload/pdf', (req, res, next) => {
 
 app.get('/chat', async (req, res) => {
   const userQuery = req.query.message;
+  // Comma-separated list of currently active filenames from the client
+  const sourcesParam = req.query.sources;
 
   if (!userQuery || typeof userQuery !== 'string' || !userQuery.trim()) {
     return res.status(400).json({ error: 'Please provide a message.' });
@@ -104,12 +113,11 @@ app.get('/chat', async (req, res) => {
   try {
     const queryVector = await embed(userQuery);
 
-    // 2. Check collection exists
     const collections = await qdrant.getCollections();
     const exists = collections.collections.some((c) => c.name === COLLECTION);
     if (!exists) {
       return res.status(200).json({
-        message: 'No files uploaded. Please upload a PDF first to get started!',
+        message: 'No files uploaded. Please upload a document first to get started!',
         docs: [],
       });
     }
@@ -118,16 +126,39 @@ app.get('/chat', async (req, res) => {
     const pointCount = collectionInfo.points_count ?? 0;
     if (pointCount === 0) {
       return res.status(200).json({
-        message: 'No files uploaded. Please upload a PDF first to get started!',
+        message: 'No files uploaded. Please upload a document first to get started!',
         docs: [],
       });
     }
 
-    const searchResults = await qdrant.search(COLLECTION, {
+    // Build an optional filter to scope results to only the user's current files
+    const activeFilenames = sourcesParam
+      ? sourcesParam.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    const searchOptions = {
       vector: queryVector,
       limit: 4,
       with_payload: true,
-    });
+    };
+
+    if (activeFilenames.length > 0) {
+      searchOptions.filter = {
+        should: activeFilenames.map((name) => ({
+          key: 'source',
+          match: { value: name },
+        })),
+      };
+    }
+
+    const searchResults = await qdrant.search(COLLECTION, searchOptions);
+
+    if (searchResults.length === 0) {
+      return res.status(200).json({
+        message: "I couldn't find relevant content in your uploaded documents. The files may still be indexing — please wait a moment and try again.",
+        docs: [],
+      });
+    }
 
     const contextText = searchResults
       .map((r, i) => {
@@ -149,14 +180,14 @@ Important rules:
 - Keep responses focused — 2 to 4 short paragraphs is usually ideal.
 
 Context retrieved from the user's uploaded documents:
-${contextText || 'No relevant content was found in the uploaded documents.'}`;
+${contextText}`;
 
     const ollamaRes = await fetch('http://localhost:11434/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'llama3',
-        stream: false,
+        model: 'phi3',
+        stream: true,
         options: { temperature: 0.4, num_predict: 800 },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
@@ -173,30 +204,65 @@ ${contextText || 'No relevant content was found in the uploaded documents.'}`;
       });
     }
 
-    const ollamaData = await ollamaRes.json();
-    const raw = ollamaData.message?.content ?? '';
-    const clean = raw
-      .replace(/\[Page \d+\]/gi, '')
-      .replace(/\[p\.\s*\d+\]/gi, '')
-      .replace(/\[Source:.*?\]/gi, '')
-      .replace(/\(Source:.*?\)/gi, '')
-      .replace(/\[\d+\]/g, '')
-      .replace(/\s{3,}/g, '\n\n')
-      .trim();
+    // Stream the response back as Server-Sent Events
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
 
-    return res.json({
-      message: clean,
-      docs: searchResults.map((r) => ({
-        pageContent: r.payload?.text,
-        metadata: { source: r.payload?.source, page: r.payload?.page },
-        score: r.score,
-      })),
-    });
+    // Send the source docs metadata first
+    const docsPayload = searchResults.map((r) => ({
+      pageContent: r.payload?.text,
+      metadata: { source: r.payload?.source, page: r.payload?.page },
+      score: r.score,
+    }));
+    res.write(`data: ${JSON.stringify({ type: 'docs', docs: docsPayload })}\n\n`);
+
+    // Stream tokens
+    const reader = ollamaRes.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      for (const line of chunk.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          const token = parsed.message?.content ?? '';
+          if (token) {
+            fullText += token;
+            res.write(`data: ${JSON.stringify({ type: 'token', token })}\n\n`);
+          }
+          if (parsed.done) {
+            const clean = fullText
+              .replace(/\[Page \d+\]/gi, '')
+              .replace(/\[p\.\s*\d+\]/gi, '')
+              .replace(/\[Source:.*?\]/gi, '')
+              .replace(/\(Source:.*?\)/gi, '')
+              .replace(/\[\d+\]/g, '')
+              .replace(/\s{3,}/g, '\n\n')
+              .trim();
+            res.write(`data: ${JSON.stringify({ type: 'done', message: clean })}\n\n`);
+          }
+        } catch {
+          // incomplete JSON line — skip
+        }
+      }
+    }
+
+    res.end();
   } catch (error) {
     console.error('Chat error:', error);
-    return res.status(500).json({
-      error: 'Something went wrong while processing your question. Please try again.',
-    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: 'Something went wrong while processing your question. Please try again.',
+      });
+    }
+    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Something went wrong.' })}\n\n`);
+    res.end();
   }
 });
 

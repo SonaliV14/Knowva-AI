@@ -16,6 +16,7 @@ interface Message {
   role: 'user' | 'ai';
   content: string;
   sources?: string[];
+  streaming?: boolean;
 }
 
 export default function ChatPage() {
@@ -37,14 +38,12 @@ export default function ChatPage() {
 
   useEffect(() => { scrollToBottom(); }, [messages, isLoading, scrollToBottom]);
 
-  // Auto-dismiss error after 4 seconds
   useEffect(() => {
     if (!errorMsg) return;
     const t = setTimeout(() => setErrorMsg(null), 4000);
     return () => clearTimeout(t);
   }, [errorMsg]);
 
-  // Auto-resize textarea
   useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
@@ -53,7 +52,6 @@ export default function ChatPage() {
   }, [input]);
 
   const addDoc = async (files: File[]) => {
-    // Check max 5 files
     if (files.length > 5) {
       setErrorMsg('Maximum 5 files can be uploaded at a time.');
       return;
@@ -80,13 +78,13 @@ export default function ChatPage() {
 
       if (!res.ok) {
         setErrorMsg(data.error || 'Upload failed.');
-        // Remove the docs we just added since upload failed
         setDocs((prev) =>
           prev.filter((d) => !newDocs.find((n) => n.id === d.id))
         );
         return;
       }
     } catch {
+      // network error — still show as processing, worker may handle it
     }
 
     setTimeout(() => {
@@ -100,8 +98,7 @@ export default function ChatPage() {
 
   const handleFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const arr = Array.from(files);
-    addDoc(arr);
+    addDoc(Array.from(files));
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -118,56 +115,116 @@ export default function ChatPage() {
     const text = input.trim();
     if (!text || isLoading) return;
 
-    // Check if any files have been uploaded
     if (docs.length === 0) {
-      setErrorMsg('No files uploaded. Please upload a PDF first!');
+      setErrorMsg('No files uploaded. Please upload a document first!');
       return;
     }
 
+    const userMsgId = Date.now();
+    const aiMsgId = userMsgId + 1;
+
     setMessages((prev) => [
       ...prev,
-      { id: Date.now(), role: 'user', content: text },
+      { id: userMsgId, role: 'user', content: text },
+      { id: aiMsgId, role: 'ai', content: '', sources: [], streaming: true },
     ]);
     setInput('');
     setIsLoading(true);
 
     try {
-      const res = await fetch(
-        `http://localhost:8000/chat?message=${encodeURIComponent(text)}`
-      );
-      const data = await res.json();
+      // Pass current indexed doc names so the server scopes the Qdrant search
+      const indexedDocs = docs.filter((d) => d.status === 'indexed');
+      const sources = indexedDocs.map((d) => d.name).join(',');
+      const url = `http://localhost:8000/chat?message=${encodeURIComponent(text)}${sources ? `&sources=${encodeURIComponent(sources)}` : ''}`;
 
-      const sources: string[] = (data.docs || [])
-        .map((d: { metadata?: { source?: string } }) =>
-          d.metadata?.source?.split('/').pop()
-        )
-        .filter(Boolean)
-        .slice(0, 3);
+      const res = await fetch(url);
+      if (!res.ok || !res.body) {
+        throw new Error('Server error');
+      }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now(),
-          role: 'ai',
-          content: cleanResponse(
-            data.message || 'I could not find an answer. Please try again.'
-          ),
-          sources,
-        },
-      ]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let streamedText = '';
+      let docSources: string[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const payload = JSON.parse(line.slice(6));
+
+            if (payload.type === 'docs') {
+              docSources = (payload.docs || [])
+                .map((d: { metadata?: { source?: string } }) =>
+                  d.metadata?.source?.split('/').pop()
+                )
+                .filter(Boolean)
+                .slice(0, 3);
+            }
+
+            if (payload.type === 'token') {
+              streamedText += payload.token;
+              const rendered = cleanResponse(streamedText);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === aiMsgId
+                    ? { ...m, content: rendered, sources: docSources }
+                    : m
+                )
+              );
+            }
+
+            if (payload.type === 'done') {
+              const rendered = cleanResponse(payload.message || streamedText);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === aiMsgId
+                    ? { ...m, content: rendered, sources: docSources, streaming: false }
+                    : m
+                )
+              );
+            }
+
+            if (payload.type === 'error') {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === aiMsgId
+                    ? { ...m, content: payload.error || 'Something went wrong.', streaming: false }
+                    : m
+                )
+              );
+            }
+          } catch {
+            // malformed SSE line — skip
+          }
+        }
+      }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now(),
-          role: 'ai',
-          content:
-            "I'm having trouble connecting to the server. Make sure it's running on port 8000 and try again.",
-          sources: [],
-        },
-      ]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.streaming
+            ? {
+                ...m,
+                content:
+                  "I'm having trouble connecting to the server. Make sure it's running on port 8000 and try again.",
+                streaming: false,
+              }
+            : m
+        )
+      );
     } finally {
       setIsLoading(false);
+      setMessages((prev) =>
+        prev.map((m) => (m.streaming ? { ...m, streaming: false } : m))
+      );
     }
   };
 
@@ -214,7 +271,7 @@ export default function ChatPage() {
           >
             <div className={styles.dropIcon}>📎</div>
             <div className={styles.dropTitle}>Drop files or click to upload</div>
-            <div className={styles.dropHint}>Max 5 PDFs at a time</div>
+            <div className={styles.dropHint}>Max 5 files at a time</div>
             <div className={styles.pills}>
               {['PDF', 'TXT', 'DOCX', 'MD'].map((t) => (
                 <span key={t} className={styles.pill}>{t}</span>
@@ -224,7 +281,7 @@ export default function ChatPage() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf,.txt,.docx,.md"
+              accept=".pdf,.txt,.docx,.md,application/pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
               style={{ display: 'none' }}
               onChange={(e) => handleFiles(e.target.files)}
             />
@@ -241,7 +298,7 @@ export default function ChatPage() {
           ) : (
             docs.map((doc) => (
               <div key={doc.id} className={styles.docItem}>
-                <div className={styles.docIcon}>📄</div>
+                <div className={styles.docIcon}>{getFileIcon(doc.name)}</div>
                 <div className={styles.docInfo}>
                   <div className={styles.docName} title={doc.name}>
                     {doc.name}
@@ -314,7 +371,7 @@ export default function ChatPage() {
 
         {/* Messages */}
         <div className={styles.messages}>
-          {messages.length === 0 && !isLoading ? (
+          {messages.length === 0 ? (
             <div className={styles.welcome}>
               <div className={styles.welcomeIcon}>🧠</div>
               <h2 className={styles.welcomeTitle}>Ask Knowva anything</h2>
@@ -365,15 +422,23 @@ export default function ChatPage() {
                       </div>
                       {msg.role === 'ai' ? (
                         <>
-                          <div
-                            className={`${styles.bubble} ${styles.bubbleAI}`}
-                            dangerouslySetInnerHTML={{ __html: msg.content }}
-                          />
-                          {msg.sources && msg.sources.length > 0 && (
+                          {msg.content ? (
+                            <div
+                              className={`${styles.bubble} ${styles.bubbleAI}`}
+                              dangerouslySetInnerHTML={{ __html: msg.content }}
+                            />
+                          ) : (
+                            <div className={styles.typingBubble} style={{ display: 'inline-flex' }}>
+                              <span className={styles.tDot} />
+                              <span className={styles.tDot} />
+                              <span className={styles.tDot} />
+                            </div>
+                          )}
+                          {msg.sources && msg.sources.length > 0 && !msg.streaming && (
                             <div className={styles.sources}>
                               {msg.sources.map((s, i) => (
                                 <span key={i} className={styles.sourcePill}>
-                                  📄 {s}
+                                  {getFileIcon(s)} {s}
                                 </span>
                               ))}
                             </div>
@@ -388,17 +453,6 @@ export default function ChatPage() {
                   </div>
                 </div>
               ))}
-
-              {isLoading && (
-                <div className={styles.typingWrap}>
-                  <div className={`${styles.avatar} ${styles.avatarAI}`}>K</div>
-                  <div className={styles.typingBubble}>
-                    <span className={styles.tDot} />
-                    <span className={styles.tDot} />
-                    <span className={styles.tDot} />
-                  </div>
-                </div>
-              )}
             </>
           )}
           <div ref={messagesEndRef} />
@@ -457,6 +511,15 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function getFileIcon(filename: string): string {
+  const ext = filename?.split('.').pop()?.toLowerCase();
+  if (ext === 'pdf') return '📄';
+  if (ext === 'docx' || ext === 'doc') return '📝';
+  if (ext === 'md') return '📋';
+  if (ext === 'txt') return '📃';
+  return '📄';
 }
 
 function cleanResponse(text: string): string {

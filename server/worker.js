@@ -3,10 +3,12 @@ import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { CharacterTextSplitter } from '@langchain/textsplitters';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { pipeline } from '@xenova/transformers';
+import { readFile } from 'fs/promises';
+import path from 'path';
 
 const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
 const COLLECTION = 'knowva-docs';
-const VECTOR_SIZE = 384; 
+const VECTOR_SIZE = 384;
 
 let embedder = null;
 async function getEmbedder() {
@@ -34,17 +36,57 @@ async function ensureCollection() {
   }
 }
 
+async function loadDocuments(filePath, filename) {
+  const ext = path.extname(filename).toLowerCase();
+
+  if (ext === '.pdf') {
+    const loader = new PDFLoader(filePath);
+    return loader.load();
+  }
+
+  // txt and md — read as plain text
+  if (ext === '.txt' || ext === '.md') {
+    const content = await readFile(filePath, 'utf-8');
+    return [{ pageContent: content, metadata: { source: filename } }];
+  }
+
+  // docx — extract text from XML parts
+  if (ext === '.docx') {
+    const { default: JSZip } = await import('jszip');
+    const buffer = await readFile(filePath);
+    const zip = await JSZip.loadAsync(buffer);
+    const xmlFile = zip.file('word/document.xml');
+    if (!xmlFile) throw new Error('Invalid DOCX: word/document.xml not found');
+    const xml = await xmlFile.async('string');
+    // Strip XML tags, decode common entities
+    const text = xml
+      .replace(/<w:br[^>]*/g, '\n')
+      .replace(/<w:p[ >][^>]*>/g, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\r\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return [{ pageContent: text, metadata: { source: filename } }];
+  }
+
+  throw new Error(`Unsupported file type: ${ext}`);
+}
+
 const worker = new Worker(
   'file-upload-queue',
   async (job) => {
-    console.log(`\n📄  Processing job:`, job.data);
+    console.log(`\n  Processing job:`, job.data);
     const data = JSON.parse(job.data);
 
     await ensureCollection();
 
-    const loader = new PDFLoader(data.path);
-    const rawDocs = await loader.load();
-    console.log(`   → Loaded ${rawDocs.length} page(s) from "${data.filename}"`);
+    const rawDocs = await loadDocuments(data.path, data.filename);
+    console.log(`   → Loaded ${rawDocs.length} section(s) from "${data.filename}"`);
 
     const splitter = new CharacterTextSplitter({
       chunkSize: 500,
